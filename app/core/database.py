@@ -1,7 +1,6 @@
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
-from datetime import datetime
+from sqlalchemy.orm import sessionmaker, declarative_base
+from datetime import datetime, timezone
 
 DATABASE_URL = "sqlite:///./hr_copilot.db"
 
@@ -19,7 +18,7 @@ class Document(Base):
     file_type   = Column(String(50))
     category    = Column(String(100), default="General")
     chunk_count = Column(Integer, default=0)
-    uploaded_at = Column(DateTime, default=datetime.utcnow)
+    uploaded_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     status      = Column(String(50), default="processing")  # processing | ready | error
 
 
@@ -30,7 +29,7 @@ class ChatMemory(Base):
     session_id = Column(String(100), nullable=False)
     role       = Column(String(20))   # user | assistant
     content    = Column(Text)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
 # ── Helpers ────────────────────────────────────────────────────

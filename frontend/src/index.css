@@ -1,0 +1,11 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Ensure the app fills the full viewport height with no scroll bleed */
+html,
+body,
+#root {
+  height: 100%;
+  overflow: hidden;
+}

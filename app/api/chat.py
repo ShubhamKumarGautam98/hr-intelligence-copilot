@@ -31,16 +31,20 @@ def ask_question(request: ChatRequest, db: Session = Depends(get_db)):
     # Generate session ID if not provided
     session_id = request.session_id or str(uuid.uuid4())
 
-    # Get conversation history for this session
+    # Get the most recent 6 messages (3 exchanges) for this session.
+    # Ordering DESC then reversing guarantees we always get the latest context,
+    # not the oldest — which matters once a conversation grows past 6 messages.
+    # The limit matches the slice in rag_engine.query_documents so we never
+    # fetch rows that are immediately discarded.
     history = db.query(ChatMemory)\
         .filter(ChatMemory.session_id == session_id)\
-        .order_by(ChatMemory.created_at.asc())\
-        .limit(10)\
+        .order_by(ChatMemory.created_at.desc())\
+        .limit(6)\
         .all()
 
     history_list = [
         {"role": msg.role, "content": msg.content}
-        for msg in history
+        for msg in reversed(history)
     ]
 
     # Query RAG engine

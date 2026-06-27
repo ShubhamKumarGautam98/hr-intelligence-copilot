@@ -1,4 +1,5 @@
 import os
+import uuid
 import shutil
 from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -28,9 +29,19 @@ async def upload_document(
             detail=f"File type .{file_ext} not supported. Allowed: {', '.join(ALLOWED_TYPES)}"
         )
 
+    # Sanitise the filename before touching the filesystem.
+    # os.path.basename() strips any directory components so that a filename
+    # like "../../main.py" becomes just "main.py", preventing path traversal.
+    # The UUID prefix guarantees uniqueness even when two users upload files
+    # with identical names — this also fixes the silent-overwrite collision bug.
+    safe_basename = os.path.basename(file.filename)
+    if not safe_basename:
+        raise HTTPException(status_code=400, detail="Invalid filename.")
+    safe_filename = f"{uuid.uuid4().hex}_{safe_basename}"
+
     # Save file
     os.makedirs(UPLOAD_DIR, exist_ok=True)
-    file_path = os.path.join(UPLOAD_DIR, file.filename)
+    file_path = os.path.join(UPLOAD_DIR, safe_filename)
 
     with open(file_path, "wb") as f:
         content = await file.read()
@@ -38,9 +49,11 @@ async def upload_document(
             raise HTTPException(status_code=400, detail="File too large. Maximum size is 25MB.")
         f.write(content)
 
-    # Create DB record
+    # Create DB record — safe_filename is the internal identifier used for all
+    # filesystem and vectorstore operations. The original file.filename is only
+    # used in the user-facing success message below.
     doc = Document(
-        filename=file.filename,
+        filename=safe_filename,
         file_type=file_ext,
         category=category,
         status="processing"
@@ -49,9 +62,10 @@ async def upload_document(
     db.commit()
     db.refresh(doc)
 
-    # Process document
+    # Process document — safe_filename must match what's stored on disk and
+    # what will be recorded in ChromaDB metadata for later deletion to work.
     try:
-        chunk_count = process_document(file_path, file.filename, category)
+        chunk_count = process_document(file_path, safe_filename, category)
         doc.chunk_count = chunk_count
         doc.status = "ready"
         db.commit()
