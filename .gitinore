@@ -1,0 +1,6 @@
+echo .env > .gitignore
+echo chroma_db/ >> .gitignore
+echo uploads/ >> .gitignore
+echo venv/ >> .gitignore
+echo __pycache__/ >> .gitignore
+echo *.db >> .gitignore
