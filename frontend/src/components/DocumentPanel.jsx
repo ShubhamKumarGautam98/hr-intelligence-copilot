@@ -3,12 +3,11 @@ import {
   Upload,
   FileText,
   Trash2,
-  CheckCircle,
   AlertCircle,
   RefreshCw,
   Database,
 } from "lucide-react"
-import { useDocuments } from "../hooks/useDocuments"
+import { useToast } from "../context/ToastContext"
 
 const CATEGORIES = ["General", "Policies", "Benefits", "Onboarding", "Compliance", "Training"]
 const ALLOWED_EXTENSIONS = ["pdf", "docx", "txt", "md"]
@@ -60,12 +59,20 @@ function StatusBadge({ status }) {
 function DocumentRow({ doc, onDelete }) {
   const [isConfirmingDelete, setIsConfirmingDelete] = useState(false)
   const [isDeleting, setIsDeleting] = useState(false)
+  const toast = useToast()
   const displayName = getDisplayFilename(doc.filename)
 
   async function handleConfirmDelete() {
     setIsDeleting(true)
-    await onDelete(doc.id)
-    // Component may unmount after delete — no need to reset state
+    const result = await onDelete(doc.id)
+    if (result.success) {
+      toast(`"${displayName}" deleted from the knowledge base.`, "success")
+    } else {
+      toast(result.error || "Failed to delete document.", "error")
+      setIsDeleting(false)
+      setIsConfirmingDelete(false)
+    }
+    // On success the row unmounts as the parent list re-renders — no further state needed
   }
 
   return (
@@ -155,21 +162,17 @@ function UploadZone({ onUpload, isUploading }) {
   const [isDragging, setIsDragging] = useState(false)
   const [selectedFile, setSelectedFile] = useState(null)
   const [category, setCategory] = useState("General")
-  const [uploadResult, setUploadResult] = useState(null) // { success, message }
   const fileInputRef = useRef(null)
+  const toast = useToast()
 
   function validateAndSelectFile(file) {
     if (!file) return
     const extension = file.name.split(".").pop().toLowerCase()
     if (!ALLOWED_EXTENSIONS.includes(extension)) {
-      setUploadResult({
-        success: false,
-        message: `Unsupported file type ".${extension}". Use PDF, DOCX, TXT, or MD.`,
-      })
+      toast(`Unsupported file type ".${extension}". Use PDF, DOCX, TXT, or MD.`, "error")
       return
     }
     setSelectedFile(file)
-    setUploadResult(null)
   }
 
   function handleDragOver(e) {
@@ -200,21 +203,17 @@ function UploadZone({ onUpload, isUploading }) {
     const result = await onUpload(selectedFile, category)
 
     if (result.success) {
-      setUploadResult({
-        success: true,
-        message: `"${getDisplayFilename(selectedFile.name)}" processed and added to the knowledge base.`,
-      })
+      toast(`"${getDisplayFilename(selectedFile.name)}" processed and added to the knowledge base.`, "success")
       setSelectedFile(null)
       // Reset so the same file can be re-uploaded if needed
       if (fileInputRef.current) fileInputRef.current.value = ""
     } else {
-      setUploadResult({ success: false, message: result.error })
+      toast(result.error || "Upload failed.", "error")
     }
   }
 
   function handleCancelSelection() {
     setSelectedFile(null)
-    setUploadResult(null)
     if (fileInputRef.current) fileInputRef.current.value = ""
   }
 
@@ -324,23 +323,6 @@ function UploadZone({ onUpload, isUploading }) {
           </div>
         )}
       </div>
-
-      {/* Upload result feedback */}
-      {uploadResult && (
-        <div
-          className={`mt-3 flex items-start gap-2 text-xs px-3 py-2.5 rounded-lg ${
-            uploadResult.success
-              ? "bg-emerald-50 text-emerald-700"
-              : "bg-red-50 text-red-600"
-          }`}
-        >
-          {uploadResult.success
-            ? <CheckCircle size={13} className="flex-shrink-0 mt-0.5" />
-            : <AlertCircle size={13} className="flex-shrink-0 mt-0.5" />
-          }
-          {uploadResult.message}
-        </div>
-      )}
     </div>
   )
 }
@@ -359,10 +341,15 @@ function UploadZone({ onUpload, isUploading }) {
  *   │ Document table (scrollable)             │
  *   └─────────────────────────────────────────┘
  */
-export default function DocumentPanel() {
-  const { documents, stats, isLoading, isUploading, error, uploadDocument, deleteDocument } =
-    useDocuments()
-
+export default function DocumentPanel({
+  documents,
+  stats,
+  isLoading,
+  isUploading,
+  error,
+  uploadDocument,
+  deleteDocument,
+}) {
   return (
     <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
 

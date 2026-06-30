@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: hr-intelligence-copilot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false   # set manually in the Render dashboard — never commit this value
+      - key: PORT
+        value: 8000
+      - key: DATA_DIR
+        value: /app/data
+    # Persistent disk — without this, the SQLite database, ChromaDB index,
+    # and uploaded files are wiped every time Render redeploys the service.
+    # Free tier supports a 1GB disk, which is enough for a small knowledge base.
+    disk:
+      name: hr-copilot-data
+      mountPath: /app/data
+      sizeGB: 1

@@ -2,6 +2,7 @@ import { useState } from "react"
 import { MessageSquare, FolderOpen, Brain, Database } from "lucide-react"
 import DocumentPanel from "./components/DocumentPanel"
 import ChatInterface from "./components/ChatInterface"
+import { useDocuments } from "./hooks/useDocuments"
 
 // Navigation items — adding views here automatically adds them to the sidebar
 const NAV_ITEMS = [
@@ -25,8 +26,9 @@ const NAV_ITEMS = [
  * Sidebar navigation button.
  * Active state: white card lift with amber icon — feels like a selected document tab.
  * Inactive state: transparent with muted text, full hover treatment.
+ * An optional `badgeCount` renders a small pill on the right when > 0.
  */
-function NavButton({ item, isActive, onClick }) {
+function NavButton({ item, isActive, badgeCount, onClick }) {
   const Icon = item.icon
   return (
     <button
@@ -46,24 +48,17 @@ function NavButton({ item, isActive, onClick }) {
           isActive ? "text-amber-500" : "text-stone-400"
         }`}
       />
-      {item.label}
+      <span className="flex-1">{item.label}</span>
+      {badgeCount > 0 && (
+        <span
+          className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full leading-none ${
+            isActive ? "bg-amber-100 text-amber-700" : "bg-stone-200 text-stone-500"
+          }`}
+        >
+          {badgeCount}
+        </span>
+      )}
     </button>
-  )
-}
-
-/**
- * Placeholder shown in the content area for views not yet built.
- * Replaced step by step as we add ChatInterface.
- */
-function ViewPlaceholder({ heading, subheading, icon: Icon }) {
-  return (
-    <div className="flex-1 flex flex-col items-center justify-center gap-3 text-center p-8">
-      <div className="w-12 h-12 rounded-xl bg-stone-100 flex items-center justify-center mb-1">
-        <Icon size={22} className="text-stone-400" />
-      </div>
-      <p className="text-sm font-medium text-stone-600">{heading}</p>
-      <p className="text-xs text-stone-400 max-w-xs">{subheading}</p>
-    </div>
   )
 }
 
@@ -77,10 +72,15 @@ function ViewPlaceholder({ heading, subheading, icon: Icon }) {
  *   │  · Nav items          │  · Active view       │
  *   │  · Footer             │                      │
  *   └──────────────────────────────────────────────┘
+ *
+ * useDocuments lives here, not inside DocumentPanel, so the sidebar badge
+ * and the panel itself always agree on the current document count — one
+ * fetch, one source of truth, no stale numbers after an upload or delete.
  */
 export default function App() {
   const [activeView, setActiveView] = useState("chat")
   const currentNavItem = NAV_ITEMS.find((item) => item.id === activeView)
+  const documentsState = useDocuments()
 
   return (
     <div className="flex h-full bg-hr-bg font-sans text-hr-ink">
@@ -111,6 +111,7 @@ export default function App() {
               key={item.id}
               item={item}
               isActive={activeView === item.id}
+              badgeCount={item.id === "documents" ? documentsState.stats.total_documents : 0}
               onClick={() => setActiveView(item.id)}
             />
           ))}
@@ -142,7 +143,7 @@ export default function App() {
         {/* Active view */}
         <div className="flex-1 flex flex-col overflow-hidden">
           {activeView === "chat" && <ChatInterface />}
-          {activeView === "documents" && <DocumentPanel />}
+          {activeView === "documents" && <DocumentPanel {...documentsState} />}
         </div>
 
       </div>
