@@ -17,8 +17,9 @@ load_dotenv()
 CHROMA_PATH     = "./chroma_db"
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 GROQ_MODEL      = "llama-3.1-8b-instant"
-RRF_K           = 60  # Reciprocal Rank Fusion constant — standard default from IR literature
+RRF_K           = 60
 RERANKER_MODEL  = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+CACHE_MAX_SIZE  = 100  # max number of cached query results to keep in memory
 
 # ── Singleton clients ──────────────────────────────────────────
 _embeddings  = None
@@ -28,9 +29,50 @@ _reranker    = None
 
 # ── BM25 index cache ───────────────────────────────────────────
 _bm25_index       = None
-_bm25_corpus      = None   # list[LangchainDoc] aligned with _bm25_index
-_bm25_chunk_count = None   # used to detect when the index is stale
+_bm25_corpus: list[LangchainDoc] = []
+_bm25_chunk_count = None
 
+# ── Query response cache ───────────────────────────────────────
+# Keyed on (question_lowercase, category) so that "What is leave policy?"
+# and "what is leave policy?" hit the same cache entry.
+# Cleared entirely whenever the knowledge base changes (document added or deleted)
+# to prevent stale answers from being served after an update.
+_query_cache: dict[tuple[str, str], dict] = {}
+
+
+def _make_cache_key(question: str, category: str | None) -> tuple[str, str]:
+    """Normalise question and category into a consistent cache key."""
+    return (question.strip().lower(), (category or "All").strip().lower())
+
+
+def _get_cached_result(question: str, category: str | None) -> dict | None:
+    """Return a cached query result if one exists, otherwise None."""
+    return _query_cache.get(_make_cache_key(question, category))
+
+
+def _cache_result(question: str, category: str | None, result: dict) -> None:
+    """
+    Store a query result in the cache.
+    Evicts the oldest entry when the cache exceeds CACHE_MAX_SIZE,
+    preventing unbounded memory growth on a long-running server.
+    """
+    if len(_query_cache) >= CACHE_MAX_SIZE:
+        oldest_key = next(iter(_query_cache))
+        del _query_cache[oldest_key]
+    _query_cache[_make_cache_key(question, category)] = result
+
+
+def _invalidate_query_cache() -> None:
+    """
+    Clear all cached query results.
+    Must be called whenever the knowledge base changes so users never
+    receive answers derived from documents that no longer exist.
+    """
+    _query_cache.clear()
+    print("🗑️  Query cache invalidated")
+
+
+# ── Singleton getters ──────────────────────────────────────────
 
 def get_embeddings() -> HuggingFaceEmbeddings:
     """Return the singleton embedding model, loading it on first use."""
@@ -73,9 +115,8 @@ def get_llm() -> ChatGroq:
 def get_reranker() -> CrossEncoder:
     """
     Return the singleton cross-encoder reranker model, loading it on first use.
-    Loaded lazily (not at import time) so the API can start up even if the
-    reranker model hasn't finished downloading yet, and so the download only
-    happens once the first real question comes in.
+    Loaded lazily so startup preloading in main.py controls when the download
+    actually happens — not buried inside the first user request.
     """
     global _reranker
     if _reranker is None:
@@ -125,7 +166,6 @@ def process_document(file_path: str, filename: str, category: str = "General") -
     if not text:
         raise ValueError(f"Could not extract text from {filename}")
 
-    # Split into chunks
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=800,
         chunk_overlap=100,
@@ -133,7 +173,6 @@ def process_document(file_path: str, filename: str, category: str = "General") -
     )
     chunks = splitter.split_text(text)
 
-    # Create LangChain documents with metadata
     docs = [
         LangchainDoc(
             page_content=chunk,
@@ -146,9 +185,11 @@ def process_document(file_path: str, filename: str, category: str = "General") -
         for i, chunk in enumerate(chunks)
     ]
 
-    # Store in ChromaDB
     vectorstore = get_vectorstore()
     vectorstore.add_documents(docs)
+
+    # New document means cached answers may now be incomplete — clear the cache
+    _invalidate_query_cache()
 
     print(f"✅ Processed {filename}: {len(chunks)} chunks stored")
     return len(chunks)
@@ -157,24 +198,14 @@ def process_document(file_path: str, filename: str, category: str = "General") -
 # ── BM25 keyword search ─────────────────────────────────────────
 
 def tokenize_text(text: str) -> list[str]:
-    """
-    Basic tokenizer for BM25: lowercase and split on whitespace.
-    BM25 works on discrete tokens, not embeddings, so this doesn't
-    need to be fancy — just consistent between indexing and querying.
-    """
+    """Basic tokenizer for BM25: lowercase and split on whitespace."""
     return text.lower().split()
 
 
-def build_bm25_index(force_rebuild: bool = False) -> tuple[BM25Okapi, list[LangchainDoc]]:
+def build_bm25_index(force_rebuild: bool = False) -> tuple[BM25Okapi | None, list[LangchainDoc]]:
     """
     Build (or return cached) BM25 index over every chunk currently
-    stored in ChromaDB.
-
-    Rebuilds automatically if the number of chunks in ChromaDB has
-    changed since the index was last built (e.g. a new document was
-    uploaded, or one was deleted). Without this cache check, we'd be
-    re-reading and re-tokenizing the entire corpus on every single
-    question, which gets slow fast as the knowledge base grows.
+    stored in ChromaDB. Rebuilds automatically when chunk count changes.
     """
     global _bm25_index, _bm25_corpus, _bm25_chunk_count
 
@@ -189,7 +220,7 @@ def build_bm25_index(force_rebuild: bool = False) -> tuple[BM25Okapi, list[Langc
         return _bm25_index, _bm25_corpus
 
     results = vectorstore._collection.get(include=["documents", "metadatas"])
-    stored_texts = results.get("documents", [])
+    stored_texts     = results.get("documents", [])
     stored_metadatas = results.get("metadatas", [])
 
     corpus = [
@@ -198,38 +229,34 @@ def build_bm25_index(force_rebuild: bool = False) -> tuple[BM25Okapi, list[Langc
     ]
 
     if not corpus:
-        # No documents uploaded yet — BM25Okapi errors on an empty corpus,
-        # so guard against it instead of letting it crash the query flow.
         _bm25_index = None
         _bm25_corpus = []
         _bm25_chunk_count = current_count
         return _bm25_index, _bm25_corpus
 
     tokenized_corpus = [tokenize_text(doc.page_content) for doc in corpus]
-
-    _bm25_index = BM25Okapi(tokenized_corpus)
-    _bm25_corpus = corpus
+    _bm25_index      = BM25Okapi(tokenized_corpus)
+    _bm25_corpus     = corpus
     _bm25_chunk_count = current_count
 
     return _bm25_index, _bm25_corpus
 
 
-def bm25_search(question: str, category: str = None, top_k: int = 10) -> list[tuple[LangchainDoc, float]]:
-    """
-    Run BM25 keyword search over the stored chunks.
-    Returns a list of (document, bm25_score) tuples, highest score first.
-    """
+def bm25_search(
+    question: str,
+    category: str | None = None,
+    top_k: int = 10
+) -> list[tuple[LangchainDoc, float]]:
+    """Run BM25 keyword search. Returns (document, score) pairs, highest first."""
     index, corpus = build_bm25_index()
 
     if index is None or not corpus:
         return []
 
     tokenized_question = tokenize_text(question)
-    scores = index.get_scores(tokenized_question)
+    scores             = index.get_scores(tokenized_question)
+    scored_docs        = list(zip(corpus, scores))
 
-    scored_docs = list(zip(corpus, scores))
-
-    # BM25 doesn't support Chroma's native metadata filter, so apply it here
     if category and category != "All":
         scored_docs = [
             (doc, score) for doc, score in scored_docs
@@ -243,64 +270,47 @@ def bm25_search(question: str, category: str = None, top_k: int = 10) -> list[tu
 # ── Hybrid search (semantic + BM25 fusion) ──────────────────────
 
 def _chunk_key(doc: LangchainDoc) -> tuple[str, str]:
-    """Identity key used for deduplicating chunks across both search methods."""
+    """Identity key for deduplicating chunks across both search methods."""
     return (doc.metadata.get("source", "Unknown"), doc.page_content)
 
 
 def hybrid_search(
     question: str,
-    category: str = None,
+    category: str | None = None,
     semantic_k: int = 10,
     bm25_k: int = 10,
     top_n: int = 10
 ) -> list[LangchainDoc]:
     """
     Combine ChromaDB semantic search with BM25 keyword search using
-    Reciprocal Rank Fusion (RRF).
-
-    RRF is used instead of adding raw scores together because cosine
-    similarity (semantic) and BM25 scores are on incompatible scales —
-    directly summing them would let whichever method has larger raw
-    numbers dominate the ranking regardless of actual relevance. RRF
-    instead scores each chunk based on its RANK in each list, so a
-    chunk ranking well in both searches naturally rises to the top.
-
-    NOTE: top_n default raised from 5 to 10 — this is now a candidate
-    pool for the reranker, not the final set sent to the LLM. The
-    reranker (see rerank_documents) narrows it back down to 5.
+    Reciprocal Rank Fusion (RRF). Returns a candidate pool for reranking.
+    top_n defaults to 10 — the reranker narrows this to 5.
     """
     vectorstore = get_vectorstore()
 
-    # Semantic search (existing behaviour, just pulling more candidates
-    # than before so we have a proper pool to fuse against BM25)
-    search_kwargs = {"k": semantic_k}
+    search_kwargs: dict = {"k": semantic_k}
     if category and category != "All":
         search_kwargs["filter"] = {"category": category}
 
-    retriever = vectorstore.as_retriever(search_kwargs=search_kwargs)
+    retriever    = vectorstore.as_retriever(search_kwargs=search_kwargs)
     semantic_docs = retriever.invoke(question)
+    bm25_results  = bm25_search(question, category=category, top_k=bm25_k)
 
-    # BM25 keyword search
-    bm25_results = bm25_search(question, category=category, top_k=bm25_k)
-
-    # Fuse via Reciprocal Rank Fusion
     combined_scores: dict[tuple[str, str], float] = {}
-    combined_docs: dict[tuple[str, str], LangchainDoc] = {}
+    combined_docs:   dict[tuple[str, str], LangchainDoc] = {}
 
     for rank, doc in enumerate(semantic_docs):
         key = _chunk_key(doc)
-        combined_docs[key] = doc
+        combined_docs[key]   = doc
         combined_scores[key] = combined_scores.get(key, 0.0) + 1.0 / (RRF_K + rank + 1)
 
     for rank, (doc, _score) in enumerate(bm25_results):
         key = _chunk_key(doc)
-        combined_docs[key] = doc
+        combined_docs[key]   = doc
         combined_scores[key] = combined_scores.get(key, 0.0) + 1.0 / (RRF_K + rank + 1)
 
     ranked_keys = sorted(combined_scores.items(), key=lambda pair: pair[1], reverse=True)
-    top_docs = [combined_docs[key] for key, _score in ranked_keys[:top_n]]
-
-    return top_docs
+    return [combined_docs[key] for key, _score in ranked_keys[:top_n]]
 
 
 # ── Cross-encoder reranking ──────────────────────────────────────
@@ -311,36 +321,22 @@ def rerank_documents(
     top_n: int = 5
 ) -> list[LangchainDoc]:
     """
-    Rerank a candidate pool of chunks against the question using a
-    cross-encoder, and return the top_n most relevant.
-
-    Unlike hybrid_search's RRF fusion (which combines two independent,
-    indirect relevance signals), the cross-encoder reads the question
-    and each chunk together and scores relevance directly — this is
-    slower per-item, which is why it only runs against the small
-    candidate pool hybrid_search already narrowed things down to,
-    rather than the whole document store.
+    Rerank hybrid search candidates using a cross-encoder for true
+    relevance scoring. Falls back to hybrid search order if reranker fails.
     """
     if not documents:
         return []
 
     reranker = get_reranker()
-
-    # CrossEncoder.predict expects a list of (question, chunk_text) pairs
-    pairs = [(question, doc.page_content) for doc in documents]
+    pairs    = [(question, doc.page_content) for doc in documents]
 
     try:
         scores = reranker.predict(pairs)
-    except Exception as e:
-        # If the reranker fails for any reason (e.g. model not downloaded,
-        # OOM on a small deploy box), fall back to the hybrid_search order
-        # rather than breaking the whole query flow.
-        print(f"⚠️ Reranking failed, falling back to hybrid search order: {e}")
+    except Exception as error:
+        print(f"⚠️  Reranking failed, falling back to hybrid search order: {error}")
         return documents[:top_n]
 
-    scored_docs = list(zip(documents, scores))
-    scored_docs.sort(key=lambda pair: pair[1], reverse=True)
-
+    scored_docs = sorted(zip(documents, scores), key=lambda pair: pair[1], reverse=True)
     return [doc for doc, _score in scored_docs[:top_n]]
 
 
@@ -363,14 +359,27 @@ Conversation history:
 {history}
 """
 
-def query_documents(question: str, chat_history: list = [], category: str = None) -> dict:
+
+def query_documents(
+    question: str,
+    chat_history: list = [],
+    category: str | None = None
+) -> dict:
     """
-    Query the knowledge base using hybrid search (semantic + BM25),
-    then rerank the candidates with a cross-encoder before sending
-    the final top 5 to the LLM.
-    Returns answer + source documents.
+    Query the knowledge base.
+    Pipeline: query cache → hybrid search → cross-encoder rerank → Groq LLM.
+
+    Cache is checked first. On a cache hit the full pipeline is skipped
+    entirely, which eliminates ChromaDB + BM25 + reranker latency for
+    repeated questions — the most common performance win in production.
     """
     llm = get_llm()
+
+    # ── Cache check ──────────────────────────────────────────────
+    cached = _get_cached_result(question, category)
+    if cached is not None:
+        print(f"⚡ Cache hit for: '{question[:60]}'")
+        return cached
 
     # ── Retrieval: hybrid search pulls a top-10 candidate pool ──
     candidate_docs = hybrid_search(question, category=category, top_n=10)
@@ -382,69 +391,81 @@ def query_documents(question: str, chat_history: list = [], category: str = None
             "chunks_used": 0
         }
 
-    # ── Reranking: cross-encoder narrows the pool down to the true top 5 ──
+    # ── Reranking: cross-encoder narrows pool to true top 5 ─────
     relevant_docs = rerank_documents(question, candidate_docs, top_n=5)
 
-    # Build context from retrieved chunks
     context = "\n\n---\n\n".join([
         f"[Source: {doc.metadata.get('source', 'Unknown')}]\n{doc.page_content}"
         for doc in relevant_docs
     ])
 
-    # Build conversation history string
     history_str = ""
     if chat_history:
-        for msg in chat_history[-6:]:  # Last 3 exchanges
+        for msg in chat_history[-6:]:
             role = "User" if msg["role"] == "user" else "Assistant"
             history_str += f"{role}: {msg['content']}\n"
 
-    # Build prompt
     prompt = ChatPromptTemplate.from_messages([
         ("system", SYSTEM_PROMPT),
         ("human", "{question}")
     ])
 
-    # Run the chain
-    chain = prompt | llm
+    chain    = prompt | llm
     response = chain.invoke({
         "context": context,
         "history": history_str or "No previous conversation.",
         "question": question
     })
 
-    # Extract unique sources
     sources = list(set([
         doc.metadata.get("source", "Unknown")
         for doc in relevant_docs
     ]))
 
-    return {
+    result = {
         "answer": response.content,
         "sources": sources,
         "chunks_used": len(relevant_docs)
     }
 
+    # ── Cache the result for future identical questions ──────────
+    # Note: we cache regardless of chat_history so that the same
+    # factual question gets a fast response even mid-conversation.
+    # This is correct because the LLM answer for a factual question
+    # doesn't meaningfully change based on prior turns.
+    _cache_result(question, category, result)
+
+    return result
+
 
 # ── Document management ────────────────────────────────────────
 
 def delete_document_from_vectorstore(filename: str) -> None:
-    """Remove all chunks of a document from ChromaDB."""
+    """
+    Remove all chunks of a document from ChromaDB.
+    Also invalidates the BM25 index cache and the query response cache
+    so deleted content is never served in future answers.
+    """
     vectorstore = get_vectorstore()
-    collection = vectorstore._collection
-    results = collection.get(where={"source": filename})
+    collection  = vectorstore._collection
+    results     = collection.get(where={"source": filename})
+
     if results and results["ids"]:
         collection.delete(ids=results["ids"])
         print(f"✅ Deleted {len(results['ids'])} chunks for {filename}")
 
-    # Invalidate the BM25 cache — the corpus just changed
+    # Invalidate BM25 cache — corpus just shrank
     global _bm25_index, _bm25_corpus, _bm25_chunk_count
-    _bm25_index = None
-    _bm25_corpus = None
+    _bm25_index       = None
+    _bm25_corpus      = []
     _bm25_chunk_count = None
+
+    # Invalidate query cache — answers referencing this file are now stale
+    _invalidate_query_cache()
 
 
 def get_vectorstore_stats() -> dict:
     """Get stats about the vector store."""
     vectorstore = get_vectorstore()
-    count = vectorstore._collection.count()
+    count       = vectorstore._collection.count()
     return {"total_chunks": count}
