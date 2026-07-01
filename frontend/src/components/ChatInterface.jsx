@@ -6,6 +6,7 @@ import {
 import { useChat } from "../hooks/useChat"
 import { useChatSessions } from "../hooks/useChatSessions"
 import { useToast } from "../context/ToastContext"
+import ChatMessage from "./ChatMessage"
 
 const CATEGORIES = ["All", "General", "Policies", "Benefits", "Onboarding", "Compliance", "Training"]
 
@@ -392,7 +393,7 @@ export default function ChatInterface() {
           ) : (
             <div className="py-4 max-w-4xl mx-auto w-full">
               {messages.map((message) => (
-                <MessageBubble key={message.id} message={message} />
+                <ChatMessage key={message.id} message={message} />
               ))}
               {isLoading && <TypingIndicator />}
 
