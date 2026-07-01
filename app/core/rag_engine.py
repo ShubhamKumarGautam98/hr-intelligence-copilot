@@ -7,21 +7,24 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document as LangchainDoc
 from langchain_core.prompts import ChatPromptTemplate
 from rank_bm25 import BM25Okapi
+from sentence_transformers import CrossEncoder
 import pypdf
 import docx
 
 load_dotenv()
 
 # ── Constants ──────────────────────────────────────────────────
-CHROMA_PATH    = "./chroma_db"
+CHROMA_PATH     = "./chroma_db"
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-GROQ_MODEL     = "llama-3.1-8b-instant"
-RRF_K          = 60  # Reciprocal Rank Fusion constant — standard default from IR literature
+GROQ_MODEL      = "llama-3.1-8b-instant"
+RRF_K           = 60  # Reciprocal Rank Fusion constant — standard default from IR literature
+RERANKER_MODEL  = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 # ── Singleton clients ──────────────────────────────────────────
 _embeddings  = None
 _vectorstore = None
 _llm         = None
+_reranker    = None
 
 # ── BM25 index cache ───────────────────────────────────────────
 _bm25_index       = None
@@ -29,7 +32,8 @@ _bm25_corpus      = None   # list[LangchainDoc] aligned with _bm25_index
 _bm25_chunk_count = None   # used to detect when the index is stale
 
 
-def get_embeddings():
+def get_embeddings() -> HuggingFaceEmbeddings:
+    """Return the singleton embedding model, loading it on first use."""
     global _embeddings
     if _embeddings is None:
         print("Loading embedding model (first time takes 1-2 min)...")
@@ -38,7 +42,8 @@ def get_embeddings():
     return _embeddings
 
 
-def get_vectorstore():
+def get_vectorstore() -> Chroma:
+    """Return the singleton ChromaDB vector store, creating it on first use."""
     global _vectorstore
     if _vectorstore is None:
         _vectorstore = Chroma(
@@ -49,7 +54,8 @@ def get_vectorstore():
     return _vectorstore
 
 
-def get_llm():
+def get_llm() -> ChatGroq:
+    """Return the singleton Groq LLM client, creating it on first use."""
     global _llm
     if _llm is None:
         api_key = os.getenv("GROQ_API_KEY")
@@ -62,6 +68,21 @@ def get_llm():
             max_tokens=1024,
         )
     return _llm
+
+
+def get_reranker() -> CrossEncoder:
+    """
+    Return the singleton cross-encoder reranker model, loading it on first use.
+    Loaded lazily (not at import time) so the API can start up even if the
+    reranker model hasn't finished downloading yet, and so the download only
+    happens once the first real question comes in.
+    """
+    global _reranker
+    if _reranker is None:
+        print("Loading cross-encoder reranker (first time takes 1-2 min)...")
+        _reranker = CrossEncoder(RERANKER_MODEL)
+        print("✅ Reranker model loaded")
+    return _reranker
 
 
 # ── Text extraction ────────────────────────────────────────────
@@ -231,7 +252,7 @@ def hybrid_search(
     category: str = None,
     semantic_k: int = 10,
     bm25_k: int = 10,
-    top_n: int = 5
+    top_n: int = 10
 ) -> list[LangchainDoc]:
     """
     Combine ChromaDB semantic search with BM25 keyword search using
@@ -243,6 +264,10 @@ def hybrid_search(
     numbers dominate the ranking regardless of actual relevance. RRF
     instead scores each chunk based on its RANK in each list, so a
     chunk ranking well in both searches naturally rises to the top.
+
+    NOTE: top_n default raised from 5 to 10 — this is now a candidate
+    pool for the reranker, not the final set sent to the LLM. The
+    reranker (see rerank_documents) narrows it back down to 5.
     """
     vectorstore = get_vectorstore()
 
@@ -278,6 +303,47 @@ def hybrid_search(
     return top_docs
 
 
+# ── Cross-encoder reranking ──────────────────────────────────────
+
+def rerank_documents(
+    question: str,
+    documents: list[LangchainDoc],
+    top_n: int = 5
+) -> list[LangchainDoc]:
+    """
+    Rerank a candidate pool of chunks against the question using a
+    cross-encoder, and return the top_n most relevant.
+
+    Unlike hybrid_search's RRF fusion (which combines two independent,
+    indirect relevance signals), the cross-encoder reads the question
+    and each chunk together and scores relevance directly — this is
+    slower per-item, which is why it only runs against the small
+    candidate pool hybrid_search already narrowed things down to,
+    rather than the whole document store.
+    """
+    if not documents:
+        return []
+
+    reranker = get_reranker()
+
+    # CrossEncoder.predict expects a list of (question, chunk_text) pairs
+    pairs = [(question, doc.page_content) for doc in documents]
+
+    try:
+        scores = reranker.predict(pairs)
+    except Exception as e:
+        # If the reranker fails for any reason (e.g. model not downloaded,
+        # OOM on a small deploy box), fall back to the hybrid_search order
+        # rather than breaking the whole query flow.
+        print(f"⚠️ Reranking failed, falling back to hybrid search order: {e}")
+        return documents[:top_n]
+
+    scored_docs = list(zip(documents, scores))
+    scored_docs.sort(key=lambda pair: pair[1], reverse=True)
+
+    return [doc for doc, _score in scored_docs[:top_n]]
+
+
 # ── RAG Query ──────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are an expert HR Knowledge Assistant for an organisation.
@@ -299,20 +365,25 @@ Conversation history:
 
 def query_documents(question: str, chat_history: list = [], category: str = None) -> dict:
     """
-    Query the knowledge base using hybrid search (semantic + BM25).
+    Query the knowledge base using hybrid search (semantic + BM25),
+    then rerank the candidates with a cross-encoder before sending
+    the final top 5 to the LLM.
     Returns answer + source documents.
     """
     llm = get_llm()
 
-    # ── Retrieval: hybrid search replaces plain semantic-only retrieval ──
-    relevant_docs = hybrid_search(question, category=category, top_n=5)
+    # ── Retrieval: hybrid search pulls a top-10 candidate pool ──
+    candidate_docs = hybrid_search(question, category=category, top_n=10)
 
-    if not relevant_docs:
+    if not candidate_docs:
         return {
             "answer": "I couldn't find any relevant information in the uploaded documents. Please make sure you have uploaded the relevant HR documents.",
             "sources": [],
             "chunks_used": 0
         }
+
+    # ── Reranking: cross-encoder narrows the pool down to the true top 5 ──
+    relevant_docs = rerank_documents(question, candidate_docs, top_n=5)
 
     # Build context from retrieved chunks
     context = "\n\n---\n\n".join([
@@ -356,7 +427,7 @@ def query_documents(question: str, chat_history: list = [], category: str = None
 
 # ── Document management ────────────────────────────────────────
 
-def delete_document_from_vectorstore(filename: str):
+def delete_document_from_vectorstore(filename: str) -> None:
     """Remove all chunks of a document from ChromaDB."""
     vectorstore = get_vectorstore()
     collection = vectorstore._collection
