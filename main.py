@@ -29,11 +29,9 @@ async def startup():
     init_db()
     print("⏳ Pre-loading embedding model...")
     get_embeddings()
-    print("⏳ Pre-loading cross-encoder reranker...")
-    get_reranker()
     print("⏳ Warming up vector store connection...")
     get_vectorstore()
-    print("✅ All models loaded — server is ready")
+    print("✅ Server is ready")
 
 @app.get("/health")
 async def health():
